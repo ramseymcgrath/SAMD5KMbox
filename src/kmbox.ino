@@ -52,15 +52,25 @@
 //--------------------------------------------------------------------+
 
 #define REMAPPER_CMD_BUFFER_SIZE 128
-#define MAX_QUEUED_REPORTS 8
+#define MAX_QUEUED_REPORTS 16  // Power of 2 for faster masking
+#define QMASK (MAX_QUEUED_REPORTS-1)
 #define BOOT_PHASE_DURATION_MS 2000
 #define REPORT_ACTIVITY_TIMEOUT_MS 500
-#define RAINBOW_SPEED 100
+#define RAINBOW_SPEED 50
 #define REPORT_ACTIVITY_SPEED 25
 #define RELEASE_MIN_TIME_MS 125
 #define RELEASE_MAX_TIME_MS 175
 #define CLICK_PRESS_MIN_TIME_MS 75
 #define CLICK_PRESS_MAX_TIME_MS 125
+
+// Debug control - comment out to disable USB debug spam
+// #define DEBUG_USB
+
+#ifndef DEBUG_USB
+  #define DLOG(...)
+#else
+  #define DLOG(...) Serial.printf(__VA_ARGS__)
+#endif
 
 //--------------------------------------------------------------------+
 // Data Structures
@@ -176,7 +186,12 @@ static const uint8_t button_masks[5] = {0x01, 0x02, 0x04, 0x08, 0x10};
 
 // Heartbeat tracking
 static uint32_t last_heartbeat = 0;
-static bool heartbeat_state = false;
+static uint8_t heartbeat_brightness = 0;
+static bool heartbeat_direction = true;  // true = fading up, false = fading down
+
+// Performance optimization caches
+static uint32_t last_neopixel_color = 0;
+static mouse_report_t last_sent_report = {0};
 
 //--------------------------------------------------------------------+
 // Utility Functions
@@ -248,6 +263,18 @@ static void hsv_to_rgb(uint16_t h, uint8_t s, uint8_t v, uint8_t* r, uint8_t* g,
     }
 }
 
+static void neopixel_push(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint32_t color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+    if (color == last_neopixel_color) return;  // Skip if color unchanged
+    
+    last_neopixel_color = color;
+    for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+        strip.setPixelColor(i, strip.Color(r, g, b));
+    }
+    strip.show();
+}
+
 static void update_neopixel_status(uint32_t current_time_ms)
 {
     uint8_t r = 0, g = 0, b = 0;
@@ -268,7 +295,16 @@ static void update_neopixel_status(uint32_t current_time_ms)
         }
         
         case STATUS_REPORT_ACTIVE: {
-            uint8_t intensity = (uint8_t)((sin((current_time_ms / (float)REPORT_ACTIVITY_SPEED) * 3.14159f / 180.0f) + 1.0f) * 127.5f);
+            // Use triangle wave instead of sin() for better performance
+            uint32_t phase = (current_time_ms / REPORT_ACTIVITY_SPEED) % 512;
+            uint8_t intensity;
+            if (phase < 256) {
+                intensity = phase;
+            } else {
+                intensity = 511 - phase;
+            }
+            intensity = intensity / 2;  // Scale to 0-127
+            
             r = intensity / 4;
             g = intensity / 4;
             b = intensity;
@@ -276,21 +312,38 @@ static void update_neopixel_status(uint32_t current_time_ms)
         }
     }
     
-    // Update all NeoPixels
-    for (int i = 0; i < NEOPIXEL_COUNT; i++) {
-        strip.setPixelColor(i, strip.Color(r, g, b));
-    }
-    strip.show();
-    
+    neopixel_push(r, g, b);
     g_state.last_status_update = current_time_ms;
 }
 
 static void update_heartbeat(uint32_t current_time_ms)
 {
-    // Update heartbeat LED every 500ms
-    if (current_time_ms - last_heartbeat >= 500) {
-        heartbeat_state = !heartbeat_state;
-        digitalWrite(LED_BUILTIN, heartbeat_state ? HIGH : LOW);
+    // Update heartbeat LED every 10ms for smooth fading
+    if (current_time_ms - last_heartbeat >= 10) {
+        uint8_t old_brightness = heartbeat_brightness;
+        
+        if (heartbeat_direction) {
+            // Fading up
+            heartbeat_brightness += 3;
+            if (heartbeat_brightness >= 255) {
+                heartbeat_brightness = 255;
+                heartbeat_direction = false;  // Start fading down
+            }
+        } else {
+            // Fading down
+            if (heartbeat_brightness <= 3) {
+                heartbeat_brightness = 0;
+                heartbeat_direction = true;  // Start fading up
+            } else {
+                heartbeat_brightness -= 3;
+            }
+        }
+        
+        // Only write if brightness changed
+        if (heartbeat_brightness != old_brightness) {
+            analogWrite(LED_BUILTIN, heartbeat_brightness);
+        }
+        
         last_heartbeat = current_time_ms;
     }
 }
@@ -311,12 +364,12 @@ static bool queue_is_full(const report_queue_t* queue)
 
 static bool queue_push(report_queue_t* queue, const mouse_report_t* report)
 {
-    if (queue_is_full(queue)) {
+    if (queue->count >= MAX_QUEUED_REPORTS) {
         return false;
     }
     
     queue->reports[queue->head] = *report;
-    queue->head = (queue->head + 1) % MAX_QUEUED_REPORTS;
+    queue->head = (queue->head + 1) & QMASK;  // Power of 2 masking
     queue->count++;
     
     return true;
@@ -324,12 +377,12 @@ static bool queue_push(report_queue_t* queue, const mouse_report_t* report)
 
 static bool queue_pop(report_queue_t* queue, mouse_report_t* report)
 {
-    if (queue_is_empty(queue)) {
+    if (queue->count == 0) {
         return false;
     }
     
     *report = queue->reports[queue->tail];
-    queue->tail = (queue->tail + 1) % MAX_QUEUED_REPORTS;
+    queue->tail = (queue->tail + 1) & QMASK;  // Power of 2 masking
     queue->count--;
     
     return true;
@@ -938,8 +991,9 @@ void setup()
     
     // Force first heartbeat
     last_heartbeat = millis();
-    heartbeat_state = true;
-    digitalWrite(LED_BUILTIN, HIGH);
+    heartbeat_brightness = 0;
+    heartbeat_direction = true;
+    analogWrite(LED_BUILTIN, 128);  // Start at medium brightness
     
     Serial.println("Setup complete!");
 }
@@ -975,7 +1029,11 @@ void loop()
             if (g_state.km_mouse_x_accumulator != 0 || g_state.km_mouse_y_accumulator != 0 || g_state.km_wheel_accumulator != 0) {
                 // Process accumulated KM movements
                 mouse_report_t km_report = remapper_process_mouse_report(&empty_report, current_time);
-                usb_hid.sendReport(0, &km_report, sizeof(mouse_report_t));
+                // Only send if different from last report
+                if (memcmp(&km_report, &last_sent_report, sizeof(km_report)) != 0) {
+                    usb_hid.sendReport(0, &km_report, sizeof(mouse_report_t));
+                    last_sent_report = km_report;
+                }
             } else {
                 // Send the current KM button state
                 uint8_t km_button_state = 0;
@@ -985,7 +1043,12 @@ void loop()
                     }
                 }
                 empty_report.buttons = km_button_state;
-                usb_hid.sendReport(0, &empty_report, sizeof(mouse_report_t));
+                
+                // Only send if different from last report
+                if (memcmp(&empty_report, &last_sent_report, sizeof(empty_report)) != 0) {
+                    usb_hid.sendReport(0, &empty_report, sizeof(mouse_report_t));
+                    last_sent_report = empty_report;
+                }
             }
             
             last_report_time = current_time;
@@ -1066,9 +1129,13 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
         // ALWAYS process and mirror reports regardless of UART connection
         mouse_report_t output_report = remapper_process_mouse_report(&input_report, current_time);
         
-        // Send modified report to PC
+        // Send modified report to PC (only if changed)
         if (usb_hid.ready()) {
-            usb_hid.sendReport(0, &output_report, sizeof(mouse_report_t));
+            // Skip sending if report is identical to last sent
+            if (memcmp(&output_report, &last_sent_report, sizeof(output_report)) != 0) {
+                usb_hid.sendReport(0, &output_report, sizeof(mouse_report_t));
+                last_sent_report = output_report;
+            }
         }
         
     } else if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD && len >= 8) {
