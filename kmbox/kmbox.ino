@@ -63,7 +63,10 @@
 #define QMASK (MAX_QUEUED_REPORTS - 1)
 #define BOOT_PHASE_DURATION_MS 2000
 #define REPORT_ACTIVITY_TIMEOUT_MS 500
-#define RAINBOW_SPEED 50
+#define RAINBOW_BASE_SPEED 150.0f         // Base rainbow speed (higher = slower)
+#define RAINBOW_MIN_SPEED 30.0f           // Fastest rainbow speed during movement
+#define RAINBOW_VELOCITY_DECAY 0.92f      // How quickly movement velocity decays
+#define RAINBOW_VELOCITY_SCALE 0.5f       // How much movement affects rainbow speed
 #define REPORT_ACTIVITY_SPEED 25
 #define RELEASE_MIN_TIME_MS 125
 #define RELEASE_MAX_TIME_MS 175
@@ -159,7 +162,7 @@ typedef struct {
 
 // New 16-bit mouse report for full precision pipeline
 // This preserves the full resolution from high-end mice like the Razer Basilisk V3
-typedef struct {
+typedef struct __attribute__((packed)) {
   uint8_t buttons;
   int16_t x;        // Full 16-bit precision - no premature clamping
   int16_t y;        // Full 16-bit precision - no premature clamping
@@ -168,7 +171,7 @@ typedef struct {
 } mouse_report16_t;
 
 static_assert(sizeof(mouse_report8_t) == 5, "mouse_report8_t must be 5 bytes");
-static_assert(sizeof(mouse_report16_t) == 8, "mouse_report16_t must be 8 bytes");
+static_assert(sizeof(mouse_report16_t) == 7, "mouse_report16_t must be 7 bytes");
 
 typedef struct {
   uint8_t modifier;
@@ -246,6 +249,11 @@ typedef struct {
   // Axis locks
   bool lock_mx;
   bool lock_my;
+
+  // Rainbow speed modulation based on mouse movement
+  float rainbow_phase;        // Smooth floating point phase for rainbow
+  float movement_velocity;    // Current movement velocity for rainbow speed
+  uint32_t last_movement_time; // Last time movement was detected
 } remapper_state_t;
 
 //--------------------------------------------------------------------+
@@ -647,8 +655,17 @@ static void neopixel_push(uint8_t r, uint8_t g, uint8_t b) {
 
 static void update_neopixel_status(uint32_t current_time_ms) {
   // During boot, update more frequently to ensure visibility
+  // For rainbow, update even more frequently for smoothness
   static uint32_t last_neopixel_update = 0;
-  uint32_t update_interval = g_state.boot_complete ? 33 : 10;  // 10ms during boot, 33ms after
+  uint32_t update_interval;
+  
+  if (!g_state.boot_complete) {
+    update_interval = 10;  // 10ms during boot
+  } else if (g_state.current_status == STATUS_RAINBOW) {
+    update_interval = 16;  // 16ms for smooth rainbow (~60fps)
+  } else {
+    update_interval = 33;  // 33ms for other statuses (~30fps)
+  }
   
   if (current_time_ms - last_neopixel_update < update_interval) return;
 
@@ -669,7 +686,25 @@ static void update_neopixel_status(uint32_t current_time_ms) {
 
     case STATUS_RAINBOW:
       {
-        uint8_t hue = (current_time_ms / RAINBOW_SPEED) & 0xFF;
+        // Decay movement velocity over time
+        if (current_time_ms - g_state.last_movement_time > 100) {
+          g_state.movement_velocity *= RAINBOW_VELOCITY_DECAY;
+        }
+        
+        // Calculate dynamic rainbow speed based on movement
+        float speed_multiplier = 1.0f + (g_state.movement_velocity * RAINBOW_VELOCITY_SCALE);
+        float current_speed = RAINBOW_BASE_SPEED - (speed_multiplier - 1.0f) * (RAINBOW_BASE_SPEED - RAINBOW_MIN_SPEED);
+        if (current_speed < RAINBOW_MIN_SPEED) current_speed = RAINBOW_MIN_SPEED;
+        
+        // Update smooth rainbow phase
+        float time_delta = (current_time_ms - last_neopixel_update) / current_speed;
+        g_state.rainbow_phase += time_delta;
+        if (g_state.rainbow_phase >= 256.0f) {
+          g_state.rainbow_phase -= 256.0f;
+        }
+        
+        // Convert smooth phase to hue with smoother transitions
+        uint8_t hue = (uint8_t)g_state.rainbow_phase;
         hsv_to_rgb_fast(hue, 255, 128, &r, &g, &b);
         break;
       }
@@ -1431,6 +1466,18 @@ static mouse_report16_t remapper_process_mouse_report(const mouse_report16_t* in
     output_report.y = (int16_t)final_y;
     output_report.wheel = (int8_t)final_wheel;
     output_report.pan = input_report->pan;  // Preserve pan instead of zeroing
+
+    // Track movement velocity for rainbow speed modulation
+    if (output_report.x != 0 || output_report.y != 0) {
+      // Calculate movement magnitude (using approximation for speed without sqrt)
+      int16_t abs_x = output_report.x < 0 ? -output_report.x : output_report.x;
+      int16_t abs_y = output_report.y < 0 ? -output_report.y : output_report.y;
+      float movement_mag = (float)(abs_x + abs_y); // Manhattan distance approximation
+      
+      // Update velocity with some smoothing
+      g_state.movement_velocity = g_state.movement_velocity * 0.7f + movement_mag * 0.3f;
+      g_state.last_movement_time = current_time_ms;
+    }
   }
 
   // DO NOT CLEAR ACCUMULATORS HERE - they need to persist until USB send succeeds
@@ -1544,6 +1591,11 @@ void setup() {
   // CRITICAL: Explicitly ensure axis locks are disabled
   g_state.lock_mx = false;
   g_state.lock_my = false;
+  
+  // Initialize rainbow variables
+  g_state.rainbow_phase = 0.0f;
+  g_state.movement_velocity = 0.0f;
+  g_state.last_movement_time = 0;
   
   phys_valid = false;
   sent_initial_zero = false;
