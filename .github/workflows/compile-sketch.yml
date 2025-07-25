@@ -1,0 +1,38 @@
+name: Compile Arduino Sketch
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  compile-sketch:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Compile Arduino sketch
+      uses: arduino/compile-sketches@v1
+      with:
+        fqbn: "adafruit:samd:adafruit_feather_m4"
+        sketch-paths: |
+          - src/
+        libraries: |
+          - name: "Adafruit TinyUSB Library"
+          - name: "Adafruit NeoPixel"
+        platforms: |
+          - name: "adafruit:samd"
+            source-url: "https://adafruit.github.io/arduino-board-index/package_adafruit_index.json"
+        verbose: false
+        enable-deltas-report: true
+        sketches-report-path: sketches-reports
+        
+    - name: Upload sketches report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: sketches-reports
+        path: sketches-reports
